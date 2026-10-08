@@ -1,6 +1,4 @@
-gspread
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-python-dotenv
-playwright
+gspread==6.0.0
+requests==2.31.0
+schedule==1.2.1
+pytz==2024.1
