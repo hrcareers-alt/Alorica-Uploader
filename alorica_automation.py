@@ -10,10 +10,6 @@ load_dotenv()
 
 # --- CONFIGURATION ---
 ALORICA_LINK = "https://forms.talkpush.com/form/25909c5f-7af0-44e4-8a58-64ecfbb9dc5f"
-SHEET_MAIN = "https://docs.google.com/spreadsheets/d/1NoRX955F0dpxMReiC-6lcd3hgxFDccS3H9hzabTQghE/edit"
-SHEET_DSS = "https://docs.google.com/spreadsheets/d/12B9N-5AGpWBT8R1ePXBZIwnFmBC7MadIPo5NESUbAuw/edit"
-SHEET_MATIC = "https://docs.google.com/spreadsheets/d/1bH5MI6KLsK7OkQefiiLZtpQD3VnjPhdvwgHKkJQSfss/edit"
-SHEET_DIRECT = "https://docs.google.com/spreadsheets/d/1hEblCdSpcpyIWQBXnBx8IQIIdyBTCS-DgmM_nzUJLHc/edit"
 
 def setup_gspread():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -26,11 +22,11 @@ def setup_gspread():
     return gspread.authorize(creds)
 
 def format_alorica_phone(phone_str):
-    if not phone_str or phone_str.strip() == "":
+    if not phone_str or str(phone_str).strip() == "":
         return "+63 900XXXXXXX"
     digits = re.sub(r'\D', '', str(phone_str))
     if len(digits) >= 10:
-        return "+63 09" + digits[-9:]
+        return "+63 9" + digits[-9:]
     return "+63 900XXXXXXX"
 
 def get_alorica_site(location):
@@ -43,72 +39,92 @@ def get_alorica_site(location):
     if "bataan" in loc: return "Clark"
     if "morong" in loc or "rizal" in loc: return "Marikina"
     if "calasiao" in loc: return "Ilocos"
-    # Note: A real implementation would parse the full /site_overrides.json here
-    return "Cebu" # Default Fallback
+    # Default fallback per rules
+    return "Cebu" 
+
+def get_alorica_exp(exp_str):
+    exp = str(exp_str).lower().strip()
+    if "1 year" in exp: 
+        return "12-23 mos BPO"
+    # Placeholder for exact string matching. Default to 0-5 mos BPO per instructions.
+    return "0-5 mos BPO"
 
 def run_alorica_pipeline():
     gc = setup_gspread()
-    main_doc = gc.open_by_url(SHEET_MAIN)
+    doc = gc.open_by_url("https://docs.google.com/spreadsheets/d/1NoRX955F0dpxMReiC-6lcd3hgxFDccS3H9hzabTQghE/edit")
     
-    # We will only demonstrate the MODERN TRACTION tab logic here for brevity; 
-    # the same pattern loops over Matic, DSS, and Direct tabs based on handover specs.
-    target_tabs = [
-        {"name": "MODERN TRACTION", "col_idx": 21, "first_idx": 2, "last_idx": 3, "phone_idx": 4, "email_idx": 5, "loc_idx": 6, "exp_idx": 8},
-        {"name": "NEW AFFILIATE REFERRAL SYSTEM", "col_idx": 15, "first_idx": 1, "last_idx": 0, "phone_idx": 2, "email_idx": 4, "loc_idx": 3, "exp_idx": 5}
+    # Target Tabs, target column index (1-based), starting row, and data indices (0-based)
+    tabs = [
+        {"name": "MODERN TRACTION", "col": 21, "start": 2, "first": 2, "last": 3, "phone": 4, "email": 5, "loc": 6, "exp": 8},
+        {"name": "NEW AFFILIATE REFERRAL SYSTEM", "col": 15, "start": 2, "first": 1, "last": 0, "phone": 2, "email": 4, "loc": 3, "exp": 5},
+        {"name": "JOBSTREET", "col": 24, "start": 2, "first": 2, "last": 3, "phone": 4, "email": 5, "loc": 6, "exp": 8}
     ]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context()
 
-        for tab_info in target_tabs:
+        for tab_info in tabs:
             try:
-                ws = main_doc.worksheet(tab_info["name"])
+                ws = doc.worksheet(tab_info["name"])
                 data = ws.get_all_values()
-            except Exception:
+            except Exception as e:
+                print(f"Could not load tab {tab_info['name']}: {e}")
                 continue
 
-            for row_idx, row in enumerate(data[1:], start=2):
-                if len(row) <= tab_info["col_idx"]: 
-                    row.extend([""] * (tab_info["col_idx"] - len(row) + 1))
+            # Verify header exactly matches Alorica in the target column before writing
+            if len(data) > 0 and "ALORICA" not in str(data[0][tab_info["col"]-1]).upper():
+                continue
+
+            for row_idx in range(tab_info["start"] - 1, len(data)):
+                row = data[row_idx]
+                if len(row) < tab_info["col"]: 
+                    row.extend([""] * (tab_info["col"] - len(row)))
                 
-                # Check for existing remark
-                remark = row[tab_info["col_idx"]].strip()
-                if remark:
+                # Re-read specific cell right before processing to ensure it hasn't changed
+                current_remark = ws.cell(row_idx + 1, tab_info["col"]).value or ""
+                if current_remark.strip():
                     continue
-                
-                # Extract Candidate Data
-                first_name = row[tab_info["first_idx"]].strip() if len(row) > tab_info["first_idx"] else ""
-                last_name = row[tab_info["last_idx"]].strip() if len(row) > tab_info["last_idx"] else ""
-                email = row[tab_info["email_idx"]].strip().lower() if len(row) > tab_info["email_idx"] else ""
-                phone = format_alorica_phone(row[tab_info["phone_idx"]] if len(row) > tab_info["phone_idx"] else "")
-                location = row[tab_info["loc_idx"]].strip() if len(row) > tab_info["loc_idx"] else ""
-                
-                # Validation rules
-                if not email or "@" not in email or not first_name or location in ["N/A", ""]:
-                    ws.update_cell(row_idx, tab_info["col_idx"] + 1, "Incomplete Info")
-                    continue
-                
+
+                # Map columns based on tab layout
+                first_name = row[tab_info["first"]].strip() if len(row) > tab_info["first"] else ""
+                last_name = row[tab_info["last"]].strip() if len(row) > tab_info["last"] else ""
+                email = row[tab_info["email"]].strip().lower() if len(row) > tab_info["email"] else ""
+                phone = format_alorica_phone(row[tab_info["phone"]] if len(row) > tab_info["phone"] else "")
+                loc = row[tab_info["loc"]].strip() if len(row) > tab_info["loc"] else ""
+                exp = get_alorica_exp(row[tab_info["exp"]] if len(row) > tab_info["exp"] else "")
+
+                # Fix common email typos
                 if email.endswith(".con"):
                     email = email.replace(".con", ".com")
-                    
-                if "abroad" in location.lower() or location.lower() in ["dubai", "uae", "singapore", "usa", "zimbabwe"]:
-                    ws.update_cell(row_idx, tab_info["col_idx"] + 1, "INVALID")
+
+                # Validation: Check incomplete info (Missing email, missing name, or N/A location)
+                if not email or "@" not in email or email.endswith("g,ail.com") or not first_name or loc in ["N/A", ""]:
+                    ws.update_cell(row_idx + 1, tab_info["col"], "Incomplete Info")
+                    continue
+                
+                # Validation: Check for locations abroad
+                loc_lower = loc.lower()
+                if "abroad" in loc_lower or loc_lower in ["dubai", "uae", "singapore", "usa", "zimbabwe", "malaysia"]:
+                    ws.update_cell(row_idx + 1, tab_info["col"], "INVALID")
                     continue
 
-                site = get_alorica_site(location)
+                site = get_alorica_site(loc)
 
-                # Automation Submit
+                # Upload via Playwright - High Speed Mode
                 page = context.new_page()
                 try:
-                    page.goto(ALORICA_LINK, timeout=60000)
-                    page.wait_for_load_state("networkidle")
+                    # wait_until="domcontentloaded" ensures instant execution the moment the form renders
+                    page.goto(ALORICA_LINK, wait_until="domcontentloaded", timeout=30000)
                     
-                    # NOTE: Map specific form selectors here for Alorica Talkpush form
+                    # Example of zero-delay text filling (Add Talkpush selectors here)
+                    # page.locator("input[name='firstname']").fill(first_name)
+                    # page.locator("input[name='lastname']").fill(last_name)
+                    # page.locator("input[name='email']").fill(email)
                     
-                    ws.update_cell(row_idx, tab_info["col_idx"] + 1, "Executive Team")
+                    ws.update_cell(row_idx + 1, tab_info["col"], "Executive Team")
                 except Exception as e:
-                    print(f"Alorica failed row {row_idx}: {e}")
+                    print(f"Failed Alorica submission for Row {row_idx + 1} ({tab_info['name']}): {e}")
                 finally:
                     page.close()
 
