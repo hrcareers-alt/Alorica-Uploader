@@ -78,6 +78,16 @@ def exp_for(exp_str):
     return "0–5 mos BPO"
 
 
+def first_email(email_str):
+    email = str(email_str or "").strip().lower()
+    # "davd33177@gmail.com / ujosh809@gmail.com" — use the first address.
+    if "/" in email:
+        email = email.split("/", 1)[0].strip()
+    if email.endswith(".con"):
+        email = email[:-4] + ".com"
+    return email
+
+
 def ready(row, tab):
     if len(row) < tab["col"]:
         row = row + [""] * (tab["col"] - len(row))
@@ -85,12 +95,10 @@ def ready(row, tab):
         return None
     first = row[tab["first"]].strip() if len(row) > tab["first"] else ""
     last = row[tab["last"]].strip() if len(row) > tab["last"] else ""
-    email = row[tab["email"]].strip().lower() if len(row) > tab["email"] else ""
+    email = first_email(row[tab["email"]] if len(row) > tab["email"] else "")
     phone_raw = row[tab["phone"]].strip() if len(row) > tab["phone"] else ""
     loc = row[tab["loc"]].strip() if len(row) > tab["loc"] else ""
     exp_raw = row[tab["exp"]].strip() if len(row) > tab["exp"] else ""
-    if email.endswith(".con"):
-        email = email.replace(".con", ".com")
     if not email or "@" not in email or email.endswith("g,ail.com") or not first or loc in ["N/A", ""]:
         return None
     if "abroad" in loc.lower() or loc.lower() in ABROAD:
@@ -229,9 +237,13 @@ def main():
                 print(f"A {shown['radio'][0] if shown['radio'] else ''}")
                 print("Q Provide the name of the City")
                 print(f"A {shown['city']}")
-                if shown["name"] != REFERRER_NAME or not phone_ok(shown["phone"], candidate["e164"]):
+                if (
+                    shown["name"] != REFERRER_NAME
+                    or not phone_ok(shown["phone"], candidate["e164"])
+                    or shown["email"].strip().lower() != candidate["email"]
+                ):
                     page.remove_listener("response", on_response)
-                    print("ABORT name or phone mismatch. Not submitted.")
+                    print("ABORT name, phone, or email mismatch. Not submitted.")
                     browser.close()
                     return 1
                 page.screenshot(path=f"/opt/cursor/artifacts/routine-{row_num}-before.png", full_page=True)
