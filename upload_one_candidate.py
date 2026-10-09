@@ -32,7 +32,11 @@ def in_window(now):
 
 
 def mobile_e164(phone_str):
-    digits = re.sub(r"\D", "", str(phone_str or ""))
+    raw = str(phone_str or "")
+    # "9666712181/9561725391" or "9666712181 / 9561725391" — use the first number.
+    if "/" in raw:
+        raw = raw.split("/", 1)[0]
+    digits = re.sub(r"\D", "", raw)
     if digits.startswith("63") and len(digits) >= 12:
         digits = digits[-10:]
     elif digits.startswith("0") and len(digits) == 11:
