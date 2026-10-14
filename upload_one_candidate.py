@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Upload one Alorica referral. Does not submit outside 08:00-01:00 Asia/Manila."""
+"""Upload Alorica referrals during 08:00-01:00 Asia/Manila.
+
+Each clock hour submits at most one candidate from the core tabs and at most
+one candidate from the MYNIMO tab.
+"""
 
 import json
 import os
@@ -22,8 +26,13 @@ TABS = [
     {"name": "NEW AFFILIATE REFERRAL SYSTEM", "col": 15, "start": 2, "first": 1, "last": 0, "phone": 2, "email": 4, "loc": 3, "exp": 5},
     {"name": "JOBSTREET", "col": 24, "start": 2, "first": 2, "last": 3, "phone": 4, "email": 5, "loc": 6, "exp": 8},
 ]
+MYNIMO_TAB = {"name": "MYNIMO", "col": 24, "start": 2, "first": 2, "last": 3, "phone": 4, "email": 5, "loc": 6, "exp": 8}
+GROUPS = [
+    ("core", TABS, "/tmp/alorica-hourly-stamp"),
+    ("mynimo", [MYNIMO_TAB], "/tmp/mynimo-hourly-stamp"),
+]
 MAX_ATTEMPTS = 5
-STAMP = "/tmp/alorica-hourly-stamp"
+STAMP = GROUPS[0][2]
 
 
 def in_window(now):
@@ -165,114 +174,156 @@ def phone_ok(shown, e164):
     return re.sub(r"\D", "", shown) == re.sub(r"\D", "", e164) and shown.startswith("+63")
 
 
+def already_done(stamp_path, hour_key, force):
+    if force:
+        return False
+    return os.path.exists(stamp_path) and open(stamp_path).read().strip() == hour_key
+
+
+def submit_candidate(page, ws, tab, row_num, candidate, stamp_path, hour_key):
+    posts = []
+
+    def on_response(resp, posts=posts):
+        if resp.request.method == "POST" and "/api/submit-lead" in resp.url:
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            posts.append(
+                {
+                    "status": resp.status,
+                    "success": body.get("success"),
+                    "code": body.get("code"),
+                }
+            )
+
+    page.on("response", on_response)
+    try:
+        shown = fill_form(page, candidate)
+        print(f"TAB {tab['name']} ROW {row_num}")
+        print("Q What is your Name")
+        print(f"A {shown['name']}")
+        print("Q What is your Referral's First Name")
+        print(f"A {shown['first']}")
+        print("Q What is your Referral's Last Name")
+        print(f"A {shown['last']}")
+        print("Q What is your Referral's Email")
+        print(f"A {shown['email']}")
+        print("Q What is your referral's phone number?")
+        print(f"A {shown['phone']}")
+        print("Q What is your refereral's preferred site?")
+        print(f"A {shown['combos'][0] if shown['combos'] else ''}")
+        print("Q What is your Referral's Experience")
+        print(f"A {shown['combos'][1] if len(shown['combos']) > 1 else ''}")
+        print("Q Which of the following communities are you a part of?")
+        print(f"A {shown['radio'][0] if shown['radio'] else ''}")
+        print("Q Provide the name of the City")
+        print(f"A {shown['city']}")
+        if (
+            shown["name"] != REFERRER_NAME
+            or not phone_ok(shown["phone"], candidate["e164"])
+            or shown["email"].strip().lower() != candidate["email"]
+        ):
+            print("ABORT name, phone, or email mismatch. Not submitted.")
+            return "abort"
+        shot = "routine-mynimo" if tab["name"] == "MYNIMO" else "routine"
+        page.screenshot(path=f"/opt/cursor/artifacts/{shot}-{row_num}-before.png", full_page=True)
+        page.get_by_test_id("button-submit").click()
+        page.wait_for_timeout(4000)
+        text = page.inner_text("body").lower()
+        page.screenshot(path=f"/opt/cursor/artifacts/{shot}-{row_num}-result.png", full_page=True)
+        duplicate = "already applied" in text or any(x.get("code") == "duplicate_application" for x in posts)
+        submitted = (not duplicate) and (
+            "submitted successfully" in text or any(x.get("success") is True for x in posts)
+        )
+        if duplicate:
+            ws.update_cell(row_num, tab["col"], "Duplicate")
+            print("RESULT duplicate MARKED Duplicate")
+            return "duplicate"
+        if submitted:
+            ws.update_cell(row_num, tab["col"], "Executive Team")
+            if stamp_path and hour_key:
+                with open(stamp_path, "w") as stamp:
+                    stamp.write(hour_key)
+            print("RESULT submitted MARKED Executive Team")
+            return "submitted"
+        print("RESULT unknown. Sheet not changed.")
+        return "unknown"
+    finally:
+        page.remove_listener("response", on_response)
+
+
+def upload_group(page, doc, label, tabs, stamp_path, hour_key, force, drain):
+    print(f"GROUP {label}")
+    if not drain and already_done(stamp_path, hour_key, force):
+        print(f"ALREADY_UPLOADED_THIS_HOUR {hour_key} {label}")
+        return 0
+    attempts = 0
+    found = False
+    for tab in tabs:
+        ws = doc.worksheet(tab["name"])
+        data = ws.get_all_values()
+        if not data or "ALORICA" not in str(data[0][tab["col"] - 1] if len(data[0]) >= tab["col"] else "").upper():
+            print(f"SKIP_TAB {tab['name']} header mismatch")
+            continue
+        for row_idx in range(tab["start"] - 1, len(data)):
+            if not drain and attempts >= MAX_ATTEMPTS:
+                print(f"ATTEMPT_CAP {label}")
+                return 0
+            candidate = ready(data[row_idx], tab)
+            if not candidate:
+                continue
+            row_num = row_idx + 1
+            remark = ws.cell(row_num, tab["col"]).value or ""
+            if remark.strip():
+                continue
+            attempts += 1
+            found = True
+            outcome = submit_candidate(
+                page,
+                ws,
+                tab,
+                row_num,
+                candidate,
+                None if drain else stamp_path,
+                None if drain else hour_key,
+            )
+            if outcome == "submitted" and not drain:
+                return 0
+            if outcome in ("abort", "unknown"):
+                return 1
+    if not found:
+        print(f"NO_CANDIDATE {label}")
+    return 0
+
+
 def main():
+    force = "--force" in sys.argv
+    drain = "--drain" in sys.argv
     now = datetime.now(TZ)
     hour_key = now.strftime("%Y-%m-%d-%H")
     print(f"NOW {now.strftime('%Y-%m-%d %H:%M %Z')}")
-    if "--force" not in sys.argv and not in_window(now):
+    if not force and not drain and not in_window(now):
         print("OUTSIDE_WINDOW 08:00-01:00 Asia/Manila. No upload.")
         return 0
-    if "--force" not in sys.argv and os.path.exists(STAMP) and open(STAMP).read().strip() == hour_key:
-        print(f"ALREADY_UPLOADED_THIS_HOUR {hour_key}")
-        return 0
+
+    groups = GROUPS
+    if "--mynimo-only" in sys.argv:
+        groups = [group for group in GROUPS if group[0] == "mynimo"]
 
     doc = worksheet_client()
-    attempts = 0
+    code = 0
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1100, "height": 2200})
-        for tab in TABS:
-            ws = doc.worksheet(tab["name"])
-            data = ws.get_all_values()
-            if not data or "ALORICA" not in str(data[0][tab["col"] - 1] if len(data[0]) >= tab["col"] else "").upper():
-                print(f"SKIP_TAB {tab['name']} header mismatch")
-                continue
-            for row_idx in range(tab["start"] - 1, len(data)):
-                if attempts >= MAX_ATTEMPTS:
-                    print("ATTEMPT_CAP")
-                    browser.close()
-                    return 1
-                candidate = ready(data[row_idx], tab)
-                if not candidate:
-                    continue
-                row_num = row_idx + 1
-                remark = ws.cell(row_num, tab["col"]).value or ""
-                if remark.strip():
-                    continue
-                attempts += 1
-                posts = []
-
-                def on_response(resp, posts=posts):
-                    if resp.request.method == "POST" and "/api/submit-lead" in resp.url:
-                        try:
-                            body = resp.json()
-                        except Exception:
-                            body = {}
-                        posts.append(
-                            {
-                                "status": resp.status,
-                                "success": body.get("success"),
-                                "code": body.get("code"),
-                            }
-                        )
-
-                page.on("response", on_response)
-                shown = fill_form(page, candidate)
-                print(f"TAB {tab['name']} ROW {row_num}")
-                print("Q What is your Name")
-                print(f"A {shown['name']}")
-                print("Q What is your Referral's First Name")
-                print(f"A {shown['first']}")
-                print("Q What is your Referral's Last Name")
-                print(f"A {shown['last']}")
-                print("Q What is your Referral's Email")
-                print(f"A {shown['email']}")
-                print("Q What is your referral's phone number?")
-                print(f"A {shown['phone']}")
-                print("Q What is your refereral's preferred site?")
-                print(f"A {shown['combos'][0] if shown['combos'] else ''}")
-                print("Q What is your Referral's Experience")
-                print(f"A {shown['combos'][1] if len(shown['combos']) > 1 else ''}")
-                print("Q Which of the following communities are you a part of?")
-                print(f"A {shown['radio'][0] if shown['radio'] else ''}")
-                print("Q Provide the name of the City")
-                print(f"A {shown['city']}")
-                if (
-                    shown["name"] != REFERRER_NAME
-                    or not phone_ok(shown["phone"], candidate["e164"])
-                    or shown["email"].strip().lower() != candidate["email"]
-                ):
-                    page.remove_listener("response", on_response)
-                    print("ABORT name, phone, or email mismatch. Not submitted.")
-                    browser.close()
-                    return 1
-                page.screenshot(path=f"/opt/cursor/artifacts/routine-{row_num}-before.png", full_page=True)
-                page.get_by_test_id("button-submit").click()
-                page.wait_for_timeout(4000)
-                text = page.inner_text("body").lower()
-                page.screenshot(path=f"/opt/cursor/artifacts/routine-{row_num}-result.png", full_page=True)
-                duplicate = "already applied" in text or any(x.get("code") == "duplicate_application" for x in posts)
-                submitted = (not duplicate) and (
-                    "submitted successfully" in text or any(x.get("success") is True for x in posts)
-                )
-                page.remove_listener("response", on_response)
-                if duplicate:
-                    ws.update_cell(row_num, tab["col"], "Duplicate")
-                    print(f"RESULT duplicate MARKED Duplicate")
-                    continue
-                if submitted:
-                    ws.update_cell(row_num, tab["col"], "Executive Team")
-                    with open(STAMP, "w") as stamp:
-                        stamp.write(hour_key)
-                    print("RESULT submitted MARKED Executive Team")
-                    browser.close()
-                    return 0
-                print("RESULT unknown. Sheet not changed.")
-                browser.close()
-                return 1
+        page.set_default_timeout(30000)
+        for label, tabs, stamp_path in groups:
+            result = upload_group(page, doc, label, tabs, stamp_path, hour_key, force, drain)
+            code = code or result
+            if result == 1 and not drain:
+                break
         browser.close()
-    print("NO_CANDIDATE")
-    return 0
+    return code
 
 
 if __name__ == "__main__":
