@@ -110,6 +110,9 @@ def ready(row, tab):
     exp_raw = row[tab["exp"]].strip() if len(row) > tab["exp"] else ""
     if not email or "@" not in email or email.endswith("g,ail.com") or not first or loc in ["N/A", ""]:
         return None
+    # A space, or a domain Talkpush will not accept, leaves the submit button disabled.
+    if any(ch.isspace() for ch in email) or not re.fullmatch(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", email):
+        return None
     if "abroad" in loc.lower() or loc.lower() in ABROAD:
         return None
     if re.fullmatch(r"[A-Za-z]?\d{3,}", loc):
